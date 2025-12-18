@@ -7,6 +7,7 @@ FastAPI로 만든 메신저 봇 애플리케이션입니다. 서버가 시작될
 - 🚀 서버 시작 시 자동으로 메시지 전송
 - 📤 수동 메시지 전송 API 제공
 - 💪 비동기 처리로 빠른 응답
+- 📊 최근 7일 내 플랜 태스크를 집계해 일간 리포트 전송
 
 ## 설치 방법
 
@@ -22,6 +23,8 @@ pip install -r requirements.txt
 MESSENGER_API_URL = "https://your-messenger-api.com/send_text"  # 메신저 API URL
 MESSENGER_TOKEN = "your_token_here"  # 메신저 API 토큰
 RECIPIENT_ID = "your_recipient_id"  # 수신자 ID
+PLANS_API_URL = "https://your-api.com/plans"  # 플랜 목록 API
+TASKS_API_URL = "https://your-api.com/tasks"  # 태스크 목록 API
 ```
 
 ## 실행 방법
@@ -41,6 +44,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 - `GET /` - 기본 엔드포인트 (봇 상태 확인)
 - `POST /send?message=메시지내용` - 수동으로 메시지 전송
 - `GET /health` - 헬스체크
+- `POST /reports/daily` - 최근 7일 내 플랜에 속한 태스크 리포트 생성 및 전송
 
 ## 사용 예시
 
