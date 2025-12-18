@@ -23,6 +23,7 @@ pip install -r requirements.txt
 MESSENGER_API_URL = "https://your-messenger-api.com/send_text"  # 메신저 API URL
 MESSENGER_TOKEN = "your_token_here"  # 메신저 API 토큰
 RECIPIENT_ID = "your_recipient_id"  # 수신자 ID
+PROJECT_ID = "your_project_id"  # 플랜/태스크 조회 시 사용할 프로젝트 ID
 PLANS_API_URL = "https://your-api.com/plans"  # 플랜 목록 API
 TASKS_API_URL = "https://your-api.com/tasks"  # 태스크 목록 API
 ```

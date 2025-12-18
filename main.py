@@ -10,6 +10,8 @@ MESSENGER_API_URL = "https://your-messenger-api.com/send_text"
 MESSENGER_TOKEN = "your_token_here"
 RECIPIENT_ID = "your_recipient_id"
 
+# 플랜/태스크 API 설정
+PROJECT_ID = "your_project_id"
 PLANS_API_URL = "https://your-api.com/plans"
 TASKS_API_URL = "https://your-api.com/tasks"
 
@@ -54,7 +56,9 @@ def _parse_datetime(value: str) -> datetime | None:
 async def fetch_plans(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     """플랜 목록을 조회합니다."""
 
-    response = await client.get(PLANS_API_URL, timeout=10.0)
+    response = await client.get(
+        PLANS_API_URL, params={"project_id": PROJECT_ID}, timeout=10.0
+    )
     response.raise_for_status()
     data = response.json()
     return data.get("plans", data)
@@ -63,7 +67,9 @@ async def fetch_plans(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
 async def fetch_tasks(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     """태스크 목록을 조회합니다."""
 
-    response = await client.get(TASKS_API_URL, timeout=10.0)
+    response = await client.get(
+        TASKS_API_URL, params={"project_id": PROJECT_ID}, timeout=10.0
+    )
     response.raise_for_status()
     data = response.json()
     return data.get("tasks", data)
@@ -118,15 +124,6 @@ async def generate_daily_report() -> str:
     return "\n".join(report_lines)
 
 
-@app.post("/reports/daily")
-async def daily_report():
-    """일간 리포트를 생성하고 메신저로 전송합니다."""
-
-    report = await generate_daily_report()
-    await send_text(report)
-    return {"status": "success", "report": report}
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """앱 시작/종료 시 실행되는 이벤트"""
@@ -147,6 +144,15 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+
+@app.post("/reports/daily")
+async def daily_report():
+    """일간 리포트를 생성하고 메신저로 전송합니다."""
+
+    report = await generate_daily_report()
+    await send_text(report)
+    return {"status": "success", "report": report}
 
 
 @app.get("/")
