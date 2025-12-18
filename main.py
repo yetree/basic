@@ -57,11 +57,14 @@ async def fetch_plans(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     """플랜 목록을 조회합니다."""
 
     response = await client.get(
-        PLANS_API_URL, params={"project_id": PROJECT_ID}, timeout=10.0
+        f"{PLANS_API_URL}/{PROJECT_ID}", timeout=10.0
     )
     response.raise_for_status()
     data = response.json()
-    return data.get("plans", data)
+    # 응답이 배열인 경우를 명확히 처리
+    if isinstance(data, list):
+        return data
+    return data.get("plans", [])
 
 
 async def fetch_tasks(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
@@ -72,7 +75,10 @@ async def fetch_tasks(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     )
     response.raise_for_status()
     data = response.json()
-    return data.get("tasks", data)
+    # 응답이 배열인 경우를 명확히 처리
+    if isinstance(data, list):
+        return data
+    return data.get("tasks", [])
 
 
 async def generate_daily_report() -> str:
