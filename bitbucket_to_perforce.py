@@ -38,7 +38,11 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # .env (기본)
+# --env-file 인수는 argparse 전에 처리해야 하므로 sys.argv를 미리 확인
+_env_idx = next((i for i, a in enumerate(sys.argv) if a == "--env-file"), None)
+if _env_idx and _env_idx + 1 < len(sys.argv):
+    load_dotenv(sys.argv[_env_idx + 1], override=True)
 
 # ── Git 설정 ─────────────────────────────────────────────────────────────────
 GIT_REPO_PATH = os.getenv("GIT_REPO_PATH", ".")
@@ -412,6 +416,8 @@ def main():
                         help="이미 제출된 커밋도 재처리")
     parser.add_argument("--no-fetch", action="store_true",
                         help="git fetch 생략")
+    parser.add_argument("--env-file", metavar="FILE",
+                        help="추가로 로드할 .env 파일 경로 (기본 .env 위에 덮어씀)")
     args = parser.parse_args()
 
     validate_config()
