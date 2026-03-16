@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Bitbucket PR → Perforce Submit (git-based)
+Bitbucket → Perforce Submit (git-based)
 
-머지 커밋을 PR 단위로 인식하여 Perforce에 changelist를 하나씩 제출합니다.
-Bitbucket API 없이 로컬 git clone만 있으면 됩니다.
+커밋 하나 = Perforce changelist 하나.
+머지 커밋(PR)뿐 아니라 master에 직접 push된 커밋, initial commit도 모두 처리합니다.
 
 동작 방식:
-  1. git log --merges 로 머지 커밋(= PR) 목록을 오래된 순으로 조회
-  2. 각 머지 커밋의 두 부모 사이 diff로 변경 파일 파악
-  3. git show <hash>:<file> 로 최종 파일 내용 추출
-  4. Perforce에 changelist 생성 → 파일 반영 → submit
+  1. git log 로 모든 커밋을 오래된 순으로 조회
+  2. 각 커밋의 변경 파일을 git diff <parent>..<commit> 으로 추출
+     - initial commit은 git diff --root 사용
+  3. git show <hash>:<file> 로 파일 내용 추출
+  4. Perforce changelist 생성 → 파일 반영 → submit
+     - 머지 커밋: 설명에 "[PR] ..." 표기
+     - 직접 커밋: "[DIRECT] ..." 표기
 
 Usage:
     python bitbucket_to_perforce.py [--dry-run] [--limit N] [--force]
                                     [--since <commit>] [--branch <name>]
+                                    [--no-fetch]
 
 Requirements:
     - git 설치 및 PATH 등록
@@ -37,16 +41,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Git 설정 ─────────────────────────────────────────────────────────────────
-GIT_REPO_PATH = os.getenv("GIT_REPO_PATH", ".")          # 로컬 git 저장소 경로
-GIT_BRANCH    = os.getenv("GIT_BRANCH", "main")           # 조회할 브랜치
-GIT_REMOTE    = os.getenv("GIT_REMOTE", "origin")         # fetch 대상 remote
+GIT_REPO_PATH = os.getenv("GIT_REPO_PATH", ".")
+GIT_BRANCH    = os.getenv("GIT_BRANCH", "master")
+GIT_REMOTE    = os.getenv("GIT_REMOTE", "origin")
 
 # ── Perforce 설정 ─────────────────────────────────────────────────────────────
 P4PORT       = os.getenv("P4PORT", "localhost:1666")
 P4USER       = os.getenv("P4USER", "")
 P4CLIENT     = os.getenv("P4CLIENT", "")
 P4PASSWD     = os.getenv("P4PASSWD", "")
-P4DEPOT_BASE = os.getenv("P4DEPOT_BASE", "//depot")       # 예: //depot/myproject
+P4DEPOT_BASE = os.getenv("P4DEPOT_BASE", "//depot")
 
 # ── 상태 파일 ─────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.getenv("STATE_FILE", "submitted_prs.json"))
@@ -72,14 +76,14 @@ def load_state() -> dict:
     return {"submitted": []}
 
 
-def is_submitted(merge_hash: str) -> bool:
-    return any(e["hash"] == merge_hash for e in load_state()["submitted"])
+def is_submitted(commit_hash: str) -> bool:
+    return any(e["hash"] == commit_hash for e in load_state()["submitted"])
 
 
-def mark_submitted(merge_hash: str, changelist: str, subject: str):
+def mark_submitted(commit_hash: str, changelist: str, subject: str):
     state = load_state()
     state["submitted"].append({
-        "hash": merge_hash,
+        "hash": commit_hash,
         "changelist": changelist,
         "subject": subject,
     })
@@ -95,28 +99,26 @@ def run_git(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     logger.debug("git %s", " ".join(args))
     result = subprocess.run(cmd, capture_output=True, text=True)
     if check and result.returncode != 0:
-        raise RuntimeError(
-            f"git {' '.join(args)} failed:\n{result.stderr.strip()}"
-        )
+        raise RuntimeError(f"git {' '.join(args)} 실패:\n{result.stderr.strip()}")
     return result
 
 
 def git_fetch():
-    """remote에서 최신 커밋 가져오기."""
     logger.info("git fetch %s %s ...", GIT_REMOTE, GIT_BRANCH)
     run_git(["fetch", GIT_REMOTE, GIT_BRANCH], check=False)
 
 
-def git_merge_commits(branch: str, since: Optional[str] = None, limit: int = 200) -> list[dict]:
+def git_all_commits(branch: str, since: Optional[str] = None, limit: int = 0) -> list[dict]:
     """
-    브랜치의 머지 커밋 목록을 오래된 순으로 반환.
+    브랜치의 모든 커밋을 오래된 순으로 반환.
+    머지 커밋 여부(is_merge)도 함께 반환.
 
     반환 형식:
-        [{"hash": str, "parents": [str, str], "subject": str,
-          "author": str, "date": str}, ...]
+        [{"hash": str, "parents": [str, ...], "subject": str,
+          "author": str, "date": str, "is_merge": bool}, ...]
     """
-    fmt = "%H%x00%P%x00%s%x00%aN%x00%aI"   # NUL 구분자로 필드 분리
-    cmd = ["log", "--merges", f"--format={fmt}", "--reverse"]
+    fmt = "%H%x00%P%x00%s%x00%aN%x00%aI"
+    cmd = ["log", f"--format={fmt}", "--reverse"]
     if since:
         cmd += [f"{since}..{branch}"]
     else:
@@ -135,26 +137,32 @@ def git_merge_commits(branch: str, since: Optional[str] = None, limit: int = 200
             continue
         commit_hash, parents_raw, subject, author, date = parts
         parents = parents_raw.split()
-        if len(parents) < 2:
-            continue   # 진짜 머지 커밋이 아닌 경우 스킵
         commits.append({
             "hash": commit_hash,
             "parents": parents,
             "subject": subject,
             "author": author,
             "date": date,
+            "is_merge": len(parents) >= 2,
+            "is_initial": len(parents) == 0,
         })
     return commits
 
 
-def git_diff_files(parent1: str, parent2: str) -> list[dict]:
+def git_diff_files(commit_hash: str, parent: Optional[str]) -> list[dict]:
     """
-    두 커밋 사이의 파일 변경 목록 반환.
+    커밋의 변경 파일 목록 반환.
+    parent가 None이면 initial commit (git diff --root).
 
     반환 형식:
         [{"status": "A"|"M"|"D"|"R", "old_path": str, "new_path": str}, ...]
     """
-    result = run_git(["diff", "--name-status", "-M", parent1, parent2])
+    if parent is None:
+        # initial commit: 트리 전체가 추가
+        result = run_git(["diff-tree", "--no-commit-id", "-r", "--name-status", commit_hash])
+    else:
+        result = run_git(["diff", "--name-status", "-M", parent, commit_hash])
+
     files = []
     for line in result.stdout.splitlines():
         line = line.strip()
@@ -163,7 +171,7 @@ def git_diff_files(parent1: str, parent2: str) -> list[dict]:
         parts = line.split("\t")
         status_raw = parts[0]
 
-        if status_raw.startswith("R"):          # Rename (R90, R100 등)
+        if status_raw.startswith("R"):
             old_path = parts[1] if len(parts) > 1 else ""
             new_path = parts[2] if len(parts) > 2 else ""
             files.append({"status": "R", "old_path": old_path, "new_path": new_path})
@@ -177,20 +185,12 @@ def git_diff_files(parent1: str, parent2: str) -> list[dict]:
 
 
 def git_file_content(commit_hash: str, file_path: str) -> Optional[bytes]:
-    """특정 커밋 시점의 파일 내용 반환. 파일이 없으면 None."""
-    result = run_git(["show", f"{commit_hash}:{file_path}"], check=False)
-    if result.returncode != 0:
-        return None
-    # binary 모드로 다시 실행
     cmd = ["git", "-C", GIT_REPO_PATH, "show", f"{commit_hash}:{file_path}"]
     result = subprocess.run(cmd, capture_output=True)
     return result.stdout if result.returncode == 0 else None
 
 
 def extract_pr_number(subject: str) -> str:
-    """커밋 메시지에서 PR 번호 추출 (Bitbucket 스타일 포함)."""
-    # Bitbucket: "Merged in feature/foo (pull request #42)"
-    # GitHub:    "Merge pull request #42 from ..."
     m = re.search(r"#(\d+)", subject)
     return f"#{m.group(1)}" if m else ""
 
@@ -201,25 +201,16 @@ def extract_pr_number(subject: str) -> str:
 
 def _p4_env() -> dict:
     env = os.environ.copy()
-    env.update({
-        "P4PORT": P4PORT,
-        "P4USER": P4USER,
-        "P4CLIENT": P4CLIENT,
-        "P4PASSWD": P4PASSWD,
-    })
+    env.update({"P4PORT": P4PORT, "P4USER": P4USER, "P4CLIENT": P4CLIENT, "P4PASSWD": P4PASSWD})
     return env
 
 
 def run_p4(args: list[str], input_text: str = None, check: bool = True) -> subprocess.CompletedProcess:
-    cmd = ["p4"] + args
-    logger.debug("p4 %s", " ".join(args))
     result = subprocess.run(
-        cmd, input=input_text, capture_output=True, text=True, env=_p4_env()
+        ["p4"] + args, input=input_text, capture_output=True, text=True, env=_p4_env()
     )
     if check and result.returncode != 0:
-        raise RuntimeError(
-            f"p4 {' '.join(args)} failed (exit {result.returncode}):\n{result.stderr.strip()}"
-        )
+        raise RuntimeError(f"p4 {' '.join(args)} 실패:\n{result.stderr.strip()}")
     return result
 
 
@@ -250,7 +241,7 @@ def p4_create_changelist(description: str) -> str:
     for token in result.stdout.split():
         if token.isdigit():
             return token
-    raise RuntimeError(f"p4 change -i 출력 파싱 실패: {result.stdout!r}")
+    raise RuntimeError(f"p4 change -i 파싱 실패: {result.stdout!r}")
 
 
 def p4_revert_delete(changelist: str):
@@ -276,43 +267,53 @@ def depot_path(file_path: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PR 단위 submit
+#  커밋 단위 submit
 # ═══════════════════════════════════════════════════════════════════════════
 
-def submit_merge_commit(
+def submit_commit(
     commit: dict,
     workspace_root: str,
     dry_run: bool = False,
 ) -> Optional[str]:
     """
-    하나의 머지 커밋(= PR)을 Perforce changelist로 제출.
+    커밋 하나를 Perforce changelist로 제출.
     성공 시 changelist 번호 반환, 실패 시 None.
     """
-    merge_hash = commit["hash"]
+    commit_hash = commit["hash"]
     parents     = commit["parents"]
     subject     = commit["subject"]
     author      = commit["author"]
     date        = commit["date"]
-    pr_num      = extract_pr_number(subject)
+    is_merge    = commit["is_merge"]
+    is_initial  = commit["is_initial"]
 
-    logger.info("─── %s %s %s", merge_hash[:8], pr_num, subject)
+    # 레이블 결정
+    if is_initial:
+        label = "[INITIAL]"
+        parent = None
+    elif is_merge:
+        pr_num = extract_pr_number(subject)
+        label  = f"[PR {pr_num}]" if pr_num else "[PR]"
+        parent = parents[0]   # 머지 대상 기준 부모 (main 쪽)
+    else:
+        label  = "[DIRECT]"
+        parent = parents[0]
 
-    # diff: 첫 번째 부모(main/master)와 두 번째 부모(feature branch) 사이
-    base_parent   = parents[0]   # main 쪽
-    feature_tip   = parents[1]   # feature 브랜치 tip
+    logger.info("─── %s %s %s", commit_hash[:8], label, subject)
 
-    changed_files = git_diff_files(base_parent, merge_hash)
+    changed_files = git_diff_files(commit_hash, parent)
     if not changed_files:
-        logger.warning("  변경 파일 없음, 건너뜀.")
+        logger.info("  변경 파일 없음, 건너뜀.")
         return None
 
     cl_description = (
-        f"[{pr_num}] {subject}\n\n"
-        f"Author:      {author}\n"
-        f"Date:        {date}\n"
-        f"Merge hash:  {merge_hash}\n"
-        f"Base parent: {base_parent}\n"
+        f"{label} {subject}\n\n"
+        f"Author:  {author}\n"
+        f"Date:    {date}\n"
+        f"Commit:  {commit_hash}\n"
     )
+    if parent:
+        cl_description += f"Parent:  {parent}\n"
 
     if dry_run:
         logger.info("  [DRY RUN] changelist 생성 예정")
@@ -339,7 +340,7 @@ def submit_merge_commit(
                     logger.warning("    DELETE 스킵 (워크스페이스에 없음): %s", old_path)
 
             elif status in ("A", "M", "C"):
-                content = git_file_content(merge_hash, new_path)
+                content = git_file_content(commit_hash, new_path)
                 if content is None:
                     logger.warning("    내용 조회 실패, 건너뜀: %s", new_path)
                     continue
@@ -348,7 +349,6 @@ def submit_merge_commit(
                 lp.parent.mkdir(parents=True, exist_ok=True)
 
                 in_depot = p4_file_in_depot(depot_path(new_path))
-
                 if status == "M" and in_depot:
                     run_p4(["edit", "-c", changelist, str(lp)])
                     lp.write_bytes(content)
@@ -359,13 +359,12 @@ def submit_merge_commit(
                     logger.info("    ADD   %s", new_path)
 
             elif status == "R":
-                # 이름 변경: 구 경로 삭제 + 새 경로 추가
                 old_lp = local_path(workspace_root, old_path)
                 if old_lp.exists():
                     run_p4(["delete", "-c", changelist, str(old_lp)])
                     logger.info("    DELETE (rename from) %s", old_path)
 
-                content = git_file_content(merge_hash, new_path)
+                content = git_file_content(commit_hash, new_path)
                 if content:
                     new_lp = local_path(workspace_root, new_path)
                     new_lp.parent.mkdir(parents=True, exist_ok=True)
@@ -399,18 +398,18 @@ def validate_config():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="git 머지 커밋을 PR 단위로 Perforce에 submit합니다."
+        description="git 커밋을 Perforce에 하나씩 submit합니다 (initial/direct/PR 모두 처리)."
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="실제 submit 없이 처리 내용만 출력")
-    parser.add_argument("--limit", type=int, default=200, metavar="N",
-                        help="최대 처리할 머지 커밋 수 (기본: 200)")
+    parser.add_argument("--limit", type=int, default=0, metavar="N",
+                        help="최대 처리할 커밋 수 (기본: 전체)")
     parser.add_argument("--since", metavar="COMMIT",
-                        help="이 커밋 이후의 머지 커밋만 처리 (git log <COMMIT>..HEAD)")
+                        help="이 커밋 이후만 처리 (git log <COMMIT>..HEAD)")
     parser.add_argument("--branch", default=GIT_BRANCH, metavar="NAME",
                         help=f"조회할 git 브랜치 (기본: {GIT_BRANCH})")
     parser.add_argument("--force", action="store_true",
-                        help="이미 제출된 커밋도 재처리 (상태 파일 무시)")
+                        help="이미 제출된 커밋도 재처리")
     parser.add_argument("--no-fetch", action="store_true",
                         help="git fetch 생략")
     args = parser.parse_args()
@@ -422,23 +421,18 @@ def main():
     except RuntimeError as e:
         logger.error("%s", e)
         sys.exit(1)
-    logger.info("Perforce 워크스페이스 경로: %s", ws_root)
+    logger.info("Perforce 워크스페이스: %s", ws_root)
 
-    # Perforce 워크스페이스 sync
     if not args.dry_run:
         logger.info("p4 sync 실행...")
-        result = run_p4(["sync"], check=False)
-        if result.returncode != 0:
-            logger.warning("p4 sync 경고: %s", result.stderr.strip())
+        run_p4(["sync"], check=False)
 
-    # git fetch
     if not args.no_fetch:
         git_fetch()
 
-    # 머지 커밋 목록 조회
-    logger.info("브랜치 '%s'의 머지 커밋 조회 중...", args.branch)
-    commits = git_merge_commits(args.branch, since=args.since, limit=args.limit)
-    logger.info("머지 커밋 %d개 발견.", len(commits))
+    logger.info("브랜치 '%s' 커밋 조회 중...", args.branch)
+    commits = git_all_commits(args.branch, since=args.since, limit=args.limit)
+    logger.info("총 %d개 커밋 (PR 머지 + 직접 커밋 + initial 포함).", len(commits))
 
     submitted = skipped = failed = 0
 
@@ -446,19 +440,18 @@ def main():
         h = commit["hash"]
 
         if not args.force and is_submitted(h):
-            logger.info("이미 제출됨 (--force로 재처리 가능): %s %s",
-                        h[:8], commit["subject"])
+            logger.info("이미 제출됨: %s %s", h[:8], commit["subject"])
             skipped += 1
             continue
 
         try:
-            cl = submit_merge_commit(commit, ws_root, dry_run=args.dry_run)
+            cl = submit_commit(commit, ws_root, dry_run=args.dry_run)
             if cl:
                 if not args.dry_run:
                     mark_submitted(h, cl, commit["subject"])
                 submitted += 1
             else:
-                failed += 1
+                skipped += 1   # 변경 파일 없어서 건너뜀
         except Exception as e:
             logger.error("실패: %s %s — %s", h[:8], commit["subject"], e)
             failed += 1
