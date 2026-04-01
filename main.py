@@ -57,11 +57,14 @@ async def fetch_plans(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     """플랜 목록을 조회합니다."""
 
     response = await client.get(
-        PLANS_API_URL, params={"project_id": PROJECT_ID}, timeout=10.0
+        f"{PLANS_API_URL}/{PROJECT_ID}", timeout=10.0
     )
     response.raise_for_status()
     data = response.json()
-    return data.get("plans", data)
+    # 응답이 배열인 경우를 명확히 처리
+    if isinstance(data, list):
+        return data
+    return data.get("plans", [])
 
 
 async def fetch_tasks(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
@@ -72,7 +75,10 @@ async def fetch_tasks(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     )
     response.raise_for_status()
     data = response.json()
-    return data.get("tasks", data)
+    # 응답이 배열인 경우를 명확히 처리
+    if isinstance(data, list):
+        return data
+    return data.get("tasks", [])
 
 
 async def generate_daily_report() -> str:
@@ -81,25 +87,47 @@ async def generate_daily_report() -> str:
     async with httpx.AsyncClient() as client:
         plans, tasks = await asyncio.gather(fetch_plans(client), fetch_tasks(client))
 
-    plan_lookup: Dict[str, Dict[str, Any]] = {
-        str(plan.get("id")): plan for plan in plans if plan.get("id") is not None
+    # task를 id로 조회할 수 있도록 딕셔너리 생성
+    task_lookup: Dict[str, Dict[str, Any]] = {
+        str(task.get("id")): task for task in tasks if task.get("id") is not None
     }
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     tasks_by_plan: Dict[str, List[Dict[str, Any]]] = {}
 
-    for task in tasks:
-        plan_id = task.get("plan_id") or task.get("planId")
-        created_at = _parse_datetime(task.get("created_at") or task.get("createdAt"))
-
-        if not plan_id or created_at is None:
+    # plan을 순회하면서 plan에 속한 task들을 찾음
+    for plan in plans:
+        plan_id = plan.get("id")
+        if not plan_id:
             continue
 
-        if created_at < cutoff:
-            continue
+        # plan이 가지고 있는 task id 목록 (여러 필드명 시도)
+        task_ids = (
+            plan.get("taskIds")
+            or plan.get("task_ids")
+            or plan.get("tasks")
+            or []
+        )
 
         plan_key = str(plan_id)
-        tasks_by_plan.setdefault(plan_key, []).append(task)
+
+        for task_id in task_ids:
+            task_id_str = str(task_id)
+            task = task_lookup.get(task_id_str)
+
+            if not task:
+                continue
+
+            # task의 creationTime 필드 확인
+            creation_time = _parse_datetime(task.get("creationTime"))
+
+            if creation_time is None:
+                continue
+
+            if creation_time < cutoff:
+                continue
+
+            tasks_by_plan.setdefault(plan_key, []).append(task)
 
     if not tasks_by_plan:
         return "최근 7일 내 플랜에 속한 태스크가 없습니다."
@@ -107,16 +135,17 @@ async def generate_daily_report() -> str:
     report_lines: List[str] = ["🗓️ 일간 태스크 리포트"]
 
     for plan_id, plan_tasks in tasks_by_plan.items():
-        plan = plan_lookup.get(plan_id, {})
+        # plan 정보를 다시 찾기
+        plan = next((p for p in plans if str(p.get("id")) == plan_id), {})
         plan_title = plan.get("title") or plan.get("name") or f"플랜 {plan_id}"
         report_lines.append(f"\n📌 {plan_title} ({len(plan_tasks)}건)")
 
         for task in plan_tasks:
             task_title = task.get("title") or task.get("name") or "제목 없음"
-            created_at = _parse_datetime(task.get("created_at") or task.get("createdAt"))
+            creation_time = _parse_datetime(task.get("creationTime"))
             created_at_display = (
-                created_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
-                if created_at
+                creation_time.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                if creation_time
                 else "날짜 미상"
             )
             report_lines.append(f"- {task_title} (생성: {created_at_display})")
